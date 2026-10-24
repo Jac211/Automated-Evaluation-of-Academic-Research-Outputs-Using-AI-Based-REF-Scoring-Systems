@@ -1,61 +1,96 @@
-# REF Academic Paper Evaluator v4
+# Automated Evaluation of Academic Research Outputs Using AI-Based REF Scoring
 
-Cleaned-up, security-fixed version of `3.0 Evaluator.ipynb`, built from your dissertation's
-Appendix A reference script and design rationale (§3.3–3.6).
+A notebook tool that gives an indicative [Research Excellence Framework](https://www.ref.ac.uk/) (REF) rating
+for an academic paper. A large language model (Cohere `command-a-03-2025`) scores the paper on
+**originality**, **significance** and **rigour**. The scores are then calibrated, weighted for impact and
+mapped to a REF band (1*–4*, with High/Middle/Low sub-bands).
+
+It accompanies the dissertation in [`dissertation/`](dissertation/), which documents the design rationale
+(§3.3–3.6), validation and limitations.
+
+> **Decision support, not a replacement for expert review.** See §5.3 of the dissertation for the ethical
+> and institutional implications.
 
 ## Setup
 
-1. Copy `.env.example` to `.env` in this folder.
-2. Replace the placeholder with your actual Cohere API key.
-3. Add `.env` to your `.gitignore` if this folder is ever version-controlled — never commit it.
-4. Open `REF_Evaluator_v4.ipynb` and run the cells top to bottom.
+Requires Python 3.10+ and a [Cohere API key](https://dashboard.cohere.com/api-keys).
 
-**If you've used this tool before with a key hardcoded in a notebook or `.env` file that you've
-since uploaded, emailed, zipped, or shared anywhere, rotate that key in your Cohere dashboard.**
-A key that has ever existed in plain text outside your local machine should be treated as
-compromised, regardless of whether you've since "fixed" the code.
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env    # then put your key in .env; it is git-ignored
+jupyter lab REF_Evaluator_v4.ipynb
+```
 
-## What changed from v3
+Run the cells top to bottom, choose one or more `.pdf` or `.txt` files and click **Evaluate**.
+Each paper's result is printed, cached in `ref_cache/` and appended to `ref_results.csv`.
 
-- **API key**: now loaded from `.env` via `python-dotenv` instead of hardcoded as a string.
-  The notebook raises a clear error on startup if the key is missing, rather than failing
-  confusingly later.
-- **JSON parsing robustness**: a malformed LLM response now retries once before giving up,
-  instead of immediately scoring the segment as `{0, 0, 0}`. A segment that still fails after
-  retrying is excluded from the average entirely, rather than dragging the calibrated score
-  down with a fake zero.
-- **Truncation transparency**: if a paper has more segments than `MAX_SEGMENTS` (default 5,
-  matching your dissertation's documented rationale of balancing context coverage against API
-  cost), the tool now explicitly tells you how many segments and roughly how many tokens were
-  skipped. `MAX_SEGMENTS` is a config variable you can raise or set to `None` to score the
-  whole paper.
-- **Cache invalidation**: cache keys now combine the file hash with the model name and a
-  `PROMPT_VERSION` string. Previously, changing the model or editing the system prompt would
-  silently keep serving old cached scores for a file you'd already evaluated. Bump
-  `PROMPT_VERSION` whenever you meaningfully change the scoring logic.
-- **Multi-file upload**: the widget now accepts multiple files in one go (v3 supported only
-  one file per run).
-- **Code structure**: split into clearly separated cells (extraction, scoring, calibration,
-  caching, pipeline, UI) with type hints and docstrings, so individual pieces can be tested
-  or reused outside the notebook.
+## Using it from Python
 
-## What was deliberately *not* changed
+```python
+import cohere
+from ref_evaluator import Config, ResultCache, evaluate_with_cache
 
-Your dissertation's Design Rationale (§3.5) explicitly justifies several things that might look
-like odd choices in isolation — these are preserved exactly as designed:
+client = cohere.ClientV2(api_key="...")
+result, from_cache = evaluate_with_cache(
+    client, "paper.pdf", open("paper.pdf", "rb").read(), Config(max_segments=None), ResultCache()
+)
+print(result.final_ref, result.segment_scores)
+```
 
-- The `rigour < 3` penalty in `calibrate_scores`, because your testing found rigour most
-  predictive of expert REF assessment.
-- The conservative penalty magnitudes, to avoid false 4* inflation.
-- The modest impact multiplier (1.00–1.15), kept small so it doesn't overshadow the core
-  quality dimensions.
-- The REF banding thresholds, which match the table in your dissertation's §3.3 exactly
-  (verified against a smoke test).
+## Method
 
-## Known carried-over limitation
+1. **Extraction**: text is taken from the PDF (`pypdf`) or TXT file, and the reference list is removed.
+2. **Segmentation**: the body is split into ~1300-word segments (≈1500 NLTK tokens, as in the dissertation).
+   By default only the first 5 are scored (`Config.max_segments`). You are warned when a paper is truncated.
+3. **Scoring**: each segment is sent in full to the LLM with a strict REF-reviewer prompt. Structured JSON
+   output, temperature 0 and a fixed seed are used. Replies must contain whole-number scores from 1 to 4.
+   Invalid replies are retried, and rate limits and server errors are retried with exponential backoff. A
+   segment that still fails is left out of the average rather than counted as zero.
+4. **Calibration** (§3.5): each segment's mean score is penalised for inconsistency (−0.5 when one dimension is
+   ≤2 and another is 4), over-generosity (−0.3 when the mean is above 3.5) and weak rigour (−0.2 when rigour
+   is below 3), with a floor of 1.0.
+5. **Impact weighting**: a multiplier of 1.00–1.15 based on how many *distinct* impact keywords appear
+   (policy, clinical, societal, …). Distinct keywords are counted, not occurrences, so keyword-dense text
+   can't inflate the score.
+6. **Banding** (§3.3): the weighted score (capped at 4.0 and rounded to 2 decimals) is mapped to a band:
 
-The impact-keyword counter in `assess_impact` uses simple word-boundary regex matching per
-keyword. Keywords that appear adjacent to each other in unnatural sequences (e.g. dense
-keyword stuffing without sentence structure) can undercount relative to keywords spread across
-natural prose. This was present in v3 and is unlikely to matter for real academic writing, but
-is worth knowing about if you ever stress-test the tool with synthetic text.
+   | Score | Band |
+   |---|---|
+   | ≥ 3.8 | High 4* |
+   | ≥ 3.5 | Middle 4* |
+   | ≥ 3.2 | Low 4* |
+   | ≥ 2.8 | High 3* |
+   | ≥ 2.5 | Middle 3* |
+   | ≥ 2.2 | Low 3* |
+   | ≥ 1.8 | High 2* |
+   | ≥ 1.5 | Middle 2* |
+   | ≥ 1.2 | Low 2* |
+   | < 1.2 | 1* |
+
+Cached results are keyed by the file's hash plus every setting that affects scores, including the prompt
+text. Changing the model, prompt, segment size or segment cap re-scores papers instead of serving stale
+results. Results where some segments failed are not cached. If you change the calibration code, bump
+`Config.scoring_version`.
+
+## Limitations
+
+- Textual proxies for originality and rigour may miss contribution types such as datasets and software.
+- Validated on life-sciences papers; results may not generalise to other fields without adaptation.
+- Scanned PDFs without OCR have no extractable text.
+- Upstream model updates can shift scores even with deterministic settings.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pre-commit install   # strips notebook outputs on commit
+pytest
+```
+
+The scoring logic lives in [`ref_evaluator/`](ref_evaluator/), and the notebook is only the interface.
+Tests use a fake client and make no API calls. CI runs them on every push.
+
+## Licence
+
+[MIT](LICENSE) © 2025 Jac Ison
